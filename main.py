@@ -298,7 +298,7 @@ class StressLSTM(nn.Module):
 def trainLSTM(X_seq, y_seq, studentIds) -> tuple:
   showBanner("Section 5: Training Bi-LSTM With Attention")
   X_tr, X_te, y_tr, y_te = train_test_split(X_seq, y_seq, test_size=testSize, random_state=randomState, stratify=y_seq)
-  device = torch.device('cuda' if torch.device.is_available() else 'cpu')
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   print(f"Device: {device}")
   trainDs = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
   testDs = TensorDataset(torch.tensor(X_te), torch.tensor(y_te))
@@ -463,7 +463,7 @@ def generateVisualizations(results: dict, cvResults: dict, LSTMHistory: dict, ou
     ax3.set_title('LSTM Training History', fontweight='bold')
     ax3.legend(loc='upper left'); ax3_twin.legend(loc='upper right')
   plt.tight_layout()
-  plt.savefig(outDir / 'ROCCmLSTM.png', dpi=200, bbox_inches='tight')
+  plt.savefig(outDir / 'ROCCMLSTM.png', dpi=200, bbox_inches='tight')
   plt.close()
   if cvResults:
     fig, ax = plt.subplots(figsize=(8, 5))

@@ -86,8 +86,10 @@ class ModelRegistry:
     cls.scaler = joblib.load(scalerPath)
     logger.info("Stacking Ensemble Loaded!")
     if LSTMPath.exists():
+      device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
       cls.LSTMModel = StressLSTM()
-      cls.LSTMModel.load_state_dict(torch.load(LSTMPath, map_location='cpu'))
+      cls.LSTMModel.load_state_dict(torch.load(LSTMPath, map_location=device))
+      cls.LSTMModel.to(device)
       cls.LSTMModel.eval()
       logger.info("LSTM Model Loaded!")
     else:
@@ -298,10 +300,11 @@ def extractSequence(req: StudentRequest) -> np.ndarray:
 def getLSTMProbability(seq: np.ndarray) -> np.ndarray:
   if registry.LSTMModel is None:
     return None
-  t = torch.tensor(seq)
+  device = next(registry.LSTMModel.parameters()).device
+  t = torch.tensor(seq).to(device)
   with torch.no_grad():
     logits = registry.LSTMModel(t)
-    prob = torch.softmax(logits, dim=1)[:, 1].numpy()
+    prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
   return prob
 def buildFullFeatureVector(tabular: np.ndarray, LSTMProb: Optional[np.ndarray]) -> np.ndarray:
   if LSTMProb is not None:

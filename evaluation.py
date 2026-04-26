@@ -91,14 +91,16 @@ def loadArtifacts():
     LSTMModel = StressLSTM(inputSize=XSeq.shape[2])
     LSTMPt = outputDir / 'LSTMModel.pt'
     if LSTMPt.exists():
-      LSTMModel.load_state_dict(torch.load(LSTMPt, map_location='cpu'))
+      device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+      LSTMModel.load_state_dict(torch.load(LSTMPt, map_location=device))
+      LSTMModel.to(device)
       LSTMModel.eval()
       with torch.no_grad():
         probs = []
         for i in range(0, len(XSeq), 256):
-          batch = torch.tensor(XSeq[i:i+256])
+          batch = torch.tensor(XSeq[i:i+256]).to(device)
           logits = LSTMModel(batch)
-          prob = torch.softmax(logits, dim=1)[:, 1].numpy()
+          prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
           probs.extend(prob)
       probsArr = np.array(probs).flatten()
       probMap = dict(zip(sidSeq, probsArr))
@@ -203,34 +205,50 @@ def shapWaterfall(artifacts: dict, nExamples: int = 6):
   XTeSc = artifacts['X_te_sc']; yTe = artifacts['y_te']; yProba = artifacts['y_proba']; featureCols = artifacts['feature_cols']
   try:
     xgbBase = artifacts['model'].named_estimators_['xgb']; explainer = shap.TreeExplainer(xgbBase); shapVals = explainer(XTeSc)
-    highIdx = np.argsort(yProba)[-3:][::-1]; lowIdx = np.argsort(yProba)[:3]; examples = list(highIdx) + list(lowIdx); labels = ['High Risk'] * 3 + ['Low Risk'] * 3
-    fig, axes = plt.subplots(2, 3, figsize=(26, 18))
-    for i, (ax, idx, lbl) in enumerate(zip(axes.flat, examples, labels)):
-      plt.sca(ax); exp = shap.Explanation(values=shapVals.values[idx], base_values=shapVals.base_values[idx], data=XTeSc[idx], feature_names=featureCols); shap.waterfall_plot(exp, max_display=10, show=False)
-      ax.set_title(f'{lbl} {i+1}\nP(stress)={yProba[idx]:.3f}', fontsize=14, fontweight='bold', pad=20)
-      plt.figure(figsize=(12, 9)); shap.waterfall_plot(exp, max_display=12, show=False); plt.title(f'Explanation: {lbl} Student {i+1}', fontsize=14, fontweight='bold'); plt.tight_layout(); plt.savefig(outputDir / f'shap{lbl.replace(" ", "")}{i+1}.png', dpi=200); plt.close()
-    plt.figure(fig.number); plt.suptitle('SHAP Waterfall — Individual Student Explanations', fontsize=24, fontweight='bold', y=1.02); plt.tight_layout(pad=4.0); plt.savefig(outputDir / 'shapWaterfall.png', dpi=150, bbox_inches='tight'); plt.close()
-    plt.figure(figsize=(12, 8)); shap.summary_plot(shapVals.values, XTeSc, feature_names=featureCols, plot_type='bar', show=False, max_display=20); plt.title('SHAP Global Feature Importance (Bar)', fontweight='bold', fontsize=14); plt.tight_layout(); plt.savefig(outputDir / 'shapGlobalBar.png', dpi=200, bbox_inches='tight'); plt.close()
-  except Exception as e: print(f"SHAP Waterfall Skipped: {e}!")
+    highIdx = np.argsort(yProba)[-3:][::-1]; lowIdx = np.argsort(yProba)[:3]; examples = list(highIdx) + list(lowIdx); labels = ['HighRisk'] * 3 + ['LowRisk'] * 3
+    print(f"Generating {len(examples)} Individual SHAP Waterfall Reports...")
+    for i, (idx, lbl) in enumerate(zip(examples, labels)):
+      subIdx = (i % 3) + 1
+      exp = shap.Explanation(values=shapVals.values[idx], base_values=shapVals.base_values[idx], data=XTeSc[idx], feature_names=featureCols)
+      plt.figure(figsize=(14, 10))
+      shap.waterfall_plot(exp, max_display=12, show=False)
+      plt.title(f'SHAP Explanation: {lbl} Student {subIdx}\nStress Probability: {yProba[idx]:.4f}', fontsize=16, fontweight='bold', pad=20)
+      plt.tight_layout()
+      fileName = f'shap{lbl}{subIdx}.png'
+      plt.savefig(outputDir / fileName, dpi=300, bbox_inches='tight')
+      plt.close()
+      print(f"Saved: {fileName}")
+    plt.figure(figsize=(14, 10)); shap.summary_plot(shapVals.values, XTeSc, feature_names=featureCols, plot_type='bar', show=False, max_display=20); plt.title('SHAP Global Feature Importance (Bar)', fontweight='bold', fontsize=16); plt.tight_layout(); plt.savefig(outputDir / 'shapGlobalBar.png', dpi=300, bbox_inches='tight'); plt.close()
+    print("Saved: shapGlobalBar.png")
+  except Exception as e: print(f"SHAP Analysis Skipped: {e}!")
 def learningCurvePlot(artifacts: dict):
   showBanner("Section 6: Learning Curve — Bias/Variance Diagnosis")
   df = artifacts['tabular_df']; feat = artifacts['feature_cols']; X = df[feat].values; y = df['stress_label'].values
+  print("Calculating Learning Curve (5-Fold Stratified CV)...")
   clf = xgb.XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, use_label_encoder=False, eval_metric='logloss', random_state=randomState, n_jobs=-1)
   tSizes, tScores, vScores = learning_curve(clf, X, y, train_sizes=np.linspace(0.1, 1.0, 10), cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=randomState), scoring='accuracy', n_jobs=-1)
-  plt.figure(figsize=(9, 5)); plt.plot(tSizes, tScores.mean(1), 'o-', color='#e74c3c', label='Training Score'); plt.plot(tSizes, vScores.mean(1), 'o-', color='#2980b9', label='CV Score')
-  plt.title('Learning Curve — Bias/Variance Diagnosis', fontweight='bold'); plt.legend(); plt.tight_layout(); plt.savefig(outputDir / 'learningCurve.png', dpi=200, bbox_inches='tight'); plt.close()
+  plt.figure(figsize=(10, 6)); plt.plot(tSizes, tScores.mean(1), 'o-', color='#e74c3c', label='Training Score', lw=2); plt.plot(tSizes, vScores.mean(1), 'o-', color='#2980b9', label='CV Score', lw=2)
+  plt.fill_between(tSizes, tScores.mean(1) - tScores.std(1), tScores.mean(1) + tScores.std(1), alpha=0.1, color='#e74c3c')
+  plt.fill_between(tSizes, vScores.mean(1) - vScores.std(1), vScores.mean(1) + vScores.std(1), alpha=0.1, color='#2980b9')
+  plt.title('Learning Curve — Bias/Variance Diagnosis', fontweight='bold', fontsize=14); plt.xlabel('Training Set Size'); plt.ylabel('Accuracy'); plt.legend(loc='best'); plt.tight_layout(); plt.savefig(outputDir / 'learningCurve.png', dpi=250, bbox_inches='tight'); plt.close()
+  print("Saved: learningCurve.png")
 def calibrationPlot(artifacts: dict):
   showBanner("Section 7: Probability Calibration Curve")
   yTe = artifacts['y_te']; yProb = artifacts['y_proba']; brier = brier_score_loss(yTe, yProb); fracPos, meanPred = calibration_curve(yTe, yProb, n_bins=10)
-  fig, axes = plt.subplots(1, 2, figsize=(13, 5)); axes[0].plot([0,1],[0,1], 'k--'); axes[0].plot(meanPred, fracPos, 's-', color='#e74c3c', label=f'Model (Brier={brier:.4f})')
-  axes[1].hist(yProb[yTe == 0], bins=25, alpha=0.6, color='#2ecc71', label='Normal'); axes[1].hist(yProb[yTe == 1], bins=25, alpha=0.6, color='#e74c3c', label='Stressed')
-  plt.suptitle('Probability Calibration Analysis', fontsize=14, fontweight='bold'); plt.tight_layout(); plt.savefig(outputDir / 'calibrationCurve.png', dpi=200, bbox_inches='tight'); plt.close()
+  print(f"Brier Score: {brier:.4f}")
+  fig, axes = plt.subplots(1, 2, figsize=(14, 6)); axes[0].plot([0,1],[0,1], 'k--', lw=1); axes[0].plot(meanPred, fracPos, 's-', color='#e74c3c', label=f'Model (Brier={brier:.4f})', markersize=8)
+  axes[1].hist(yProb[yTe == 0], bins=30, alpha=0.6, color='#2ecc71', label='Normal (Target=0)', edgecolor='black'); axes[1].hist(yProb[yTe == 1], bins=30, alpha=0.6, color='#e74c3c', label='Stressed (Target=1)', edgecolor='black')
+  axes[0].set_title('Calibration Curve (Reliability Diagram)', fontweight='bold'); axes[1].set_title('Probability Distribution By Class', fontweight='bold')
+  plt.suptitle('Probability Calibration Analysis', fontsize=16, fontweight='bold', y=1.02); plt.tight_layout(); plt.savefig(outputDir / 'calibrationCurve.png', dpi=250, bbox_inches='tight'); plt.close()
+  print("Saved: calibrationCurve.png")
 def exportLatexTable(ciDf: pd.DataFrame, ablationDf: pd.DataFrame, mcnemarRes: dict):
   showBanner("Section 8: Exporting LaTeX Results Table")
-  lines = [r"\begin{table}[h]", r"\centering", r"\caption{Results}", r"\begin{tabular}{lrrr}", r"\toprule", r"Metric & Point & CI Lo & CI Hi \\", r"\midrule"]
+  print("Formatting Metrics Into LaTeX Table Format...")
+  lines = [r"\begin{table}[h]", r"\centering", r"\caption{Academic Stress Detection Performance (OULAD)}", r"\begin{tabular}{lrrr}", r"\toprule", r"Metric & Point Estimate & CI Lower (2.5\%) & CI Upper (97.5\%) \\", r"\midrule"]
   for _, row in ciDf.iterrows(): lines.append(f"  {row['Metric']} & {row['Point Estimate']:.4f} & {row['CI Lower (2.5%)']:.4f} & {row['CI Upper (97.5%)']:.4f} \\\\")
   lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
   (outputDir / "resultsTable.tex").write_text("\n".join(lines), encoding='utf-8')
+  print("Saved: resultsTable.tex")
 def main():
   showBanner("Evaluation Suite — Stress Detection Research")
   artifacts = loadArtifacts()

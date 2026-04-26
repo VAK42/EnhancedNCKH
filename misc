@@ -1,0 +1,289 @@
+|-- main.py --|
+================================================================================
+Stress Detection Via LMS Digital Signals
+Pipeline: OULAD-Based Stress Detection
+Target  : 95–98% Accuracy Via Hybrid LSTM + XGBoost Stacking
+================================================================================
+Started: 2026-04-27 01:25:28
+
+Phase 1: Loading Datasets...
+
+================================================================================
+Section 1: Loading OULAD Dataset
+================================================================================
+Loaded Student Info →   32,593 Rows
+Loaded Student VLE → 10,655,280 Rows  (Merged With vle.csv)
+Loaded Student Assessment →  173,912 Rows
+Loaded Assessments →      206 Rows
+Unique Students →   28,785
+Datasets Loaded In 6.55s
+
+Phase 2: Building Labels & Feature Engineering...
+
+================================================================================
+Section 2: Label Construction — Stress Proxy
+================================================================================
+
+Total Students: 28,785
+Stressed (1): 15,372  (53.4%)
+Normal (0): 13,413  (46.6%)
+
+================================================================================
+Section 3a: VLE Feature Engineering (Session & Temporal)
+================================================================================
+... Engineered VLE Features For 5,000 Students
+... Engineered VLE Features For 10,000 Students
+... Engineered VLE Features For 15,000 Students
+... Engineered VLE Features For 20,000 Students
+... Engineered VLE Features For 25,000 Students
+VLE Features Shape: (26074, 24)
+
+================================================================================
+Section 3b: Assessment Feature Engineering
+================================================================================
+... Engineered Assessment Features For 5,000 Students
+... Engineered Assessment Features For 10,000 Students
+... Engineered Assessment Features For 15,000 Students
+... Engineered Assessment Features For 20,000 Students
+Assessment Features Shape: (23351, 9)
+
+================================================================================
+Section 3c: Student Info Features
+================================================================================
+Student Info Features Shape: (32593, 7)
+
+================================================================================
+Section 3d: Merging All Feature Tables
+================================================================================
+Final Merged Shape: (32593, 39)
+Feature Count: 37
+Feature Engineering Completed In 76.45s
+
+Phase 3: OULAD Sequence Building & LSTM Training...
+
+================================================================================
+Section 4: Building LSTM Sequences From VLE Logs
+================================================================================
+... Built Sequences For 5,000 Students
+... Built Sequences For 10,000 Students
+... Built Sequences For 15,000 Students
+... Built Sequences For 20,000 Students
+... Built Sequences For 25,000 Students
+Sequence Tensor Shape: (26074, 30, 4)
+Label Distribution: Normal=13410 | Stressed=12664
+
+================================================================================
+Section 5: Training Bi-LSTM With Attention
+================================================================================
+Device: cpu
+Epoch [01/30]  Loss: 0.3557  Val Acc: 0.8619
+Epoch [02/30]  Loss: 0.3265  Val Acc: 0.8617
+Epoch [03/30]  Loss: 0.3256  Val Acc: 0.8621
+Epoch [04/30]  Loss: 0.3235  Val Acc: 0.8642
+Epoch [05/30]  Loss: 0.3217  Val Acc: 0.8663
+Epoch [06/30]  Loss: 0.3212  Val Acc: 0.8662
+Epoch [07/30]  Loss: 0.3203  Val Acc: 0.8685
+Epoch [08/30]  Loss: 0.3178  Val Acc: 0.8688
+Epoch [09/30]  Loss: 0.3170  Val Acc: 0.8685
+Epoch [10/30]  Loss: 0.3165  Val Acc: 0.8685
+Epoch [11/30]  Loss: 0.3149  Val Acc: 0.8708
+Epoch [12/30]  Loss: 0.3153  Val Acc: 0.8694
+Epoch [13/30]  Loss: 0.3146  Val Acc: 0.8671
+Epoch [14/30]  Loss: 0.3129  Val Acc: 0.8708
+Epoch [15/30]  Loss: 0.3137  Val Acc: 0.8677
+Epoch [16/30]  Loss: 0.3126  Val Acc: 0.8702
+Epoch [17/30]  Loss: 0.3119  Val Acc: 0.8709
+Epoch [18/30]  Loss: 0.3110  Val Acc: 0.8702
+Epoch [19/30]  Loss: 0.3115  Val Acc: 0.8719
+Epoch [20/30]  Loss: 0.3105  Val Acc: 0.8711
+Epoch [21/30]  Loss: 0.3099  Val Acc: 0.8704
+Epoch [22/30]  Loss: 0.3103  Val Acc: 0.8704
+Epoch [23/30]  Loss: 0.3101  Val Acc: 0.8706
+Epoch [24/30]  Loss: 0.3088  Val Acc: 0.8708
+Epoch [25/30]  Loss: 0.3079  Val Acc: 0.8700
+Epoch [26/30]  Loss: 0.3077  Val Acc: 0.8692
+Epoch [27/30]  Loss: 0.3085  Val Acc: 0.8708
+Epoch [28/30]  Loss: 0.3076  Val Acc: 0.8702
+Epoch [29/30]  Loss: 0.3078  Val Acc: 0.8706
+Epoch [30/30]  Loss: 0.3078  Val Acc: 0.8708
+
+Best LSTM Val Accuracy: 0.8719
+LSTM Training Completed In 354.41s
+
+Phase 4: Training Stacking Ensemble (XGBoost + LightGBM + Meta)...
+
+================================================================================
+Section 7: Stacking Ensemble — XGBoost + LightGBM + LSTM
+================================================================================
+Combined Feature Dim  : 38 (37 Tabular + 1 LSTM)
+
+After SMOTE — Normal: 12451 | Stressed: 12451
+
+Fitting Stacking Ensemble (This May Take A Few Minutes)...
+
+------------------------------------------------------------
+Ensemble Results (Default Threshold = 0.5)
+------------------------------------------------------------
+Accuracy: 0.9230
+Precision: 0.9483
+Recall: 0.9020
+F1-Score: 0.9246
+ROC-AUC: 0.9749
+MCC: 0.8472
+
+Ensemble Results (Youden Threshold = 0.378)
+------------------------------------------------------------
+Accuracy: 0.9252
+Precision: 0.9388
+Recall: 0.9168
+F1-Score: 0.9277
+MCC: 0.8505
+
+              precision    recall  f1-score   support
+
+      Normal       0.91      0.93      0.92      2836
+    Stressed       0.94      0.92      0.93      3113
+
+    accuracy                           0.93      5949
+   macro avg       0.92      0.93      0.93      5949
+weighted avg       0.93      0.93      0.93      5949
+
+Stacking Ensemble Completed In 28.48s
+
+Phase 5: Running Stratified K-Fold Cross Validation...
+
+================================================================================
+Section 8: Stratified K-Fold Cross Validation
+================================================================================
+
+XGBoost (CV With SMOTE):
+  Mean Acc: 0.9155 ± 0.0029
+  Folds: ['0.9160', '0.9139', '0.9129', '0.9210', '0.9138']
+
+LightGBM (CV With SMOTE):
+  Mean Acc: 0.9175 ± 0.0047
+  Folds: ['0.9193', '0.9181', '0.9122', '0.9250', '0.9126']
+Cross Validation Completed In 21.28s
+
+Phase 6: Running SHAP Interpretability Analysis...
+
+================================================================================
+Section 9: SHAP Feature Interpretability
+================================================================================
+SHAP Summary Saved → shapSummary.png
+SHAP Analysis Completed In 6.59s
+
+Phase 7: Generating Output Visualizations...
+
+================================================================================
+Section 10: Generating Visualizations
+================================================================================
+
+All Visualizations Saved To: nckh
+Visualizations Generated In 1.52s
+
+Phase 8: Exporting Final Models...
+
+================================================================================
+Section 11: Exporting Models
+================================================================================
+seqNorm.pkl          → nckh
+stackingEnsemble.pkl → nckh
+scaler.pkl            → nckh
+LSTMModel.pt         → nckh
+Model Export Completed In 0.11s
+
+================================================================================
+Pipeline Complete
+================================================================================
+
+Final Accuracy: 0.9252
+Final F1-Score: 0.9277
+Final ROC-AUC: 0.9749
+Total Pipeline Elapsed Time: 495.39s
+Outputs Saved To: C:\Users\VAK\Downloads\EnhancedNCKH\nckh
+
+================================================================================
+
+|-- server.py --|
+| INFO | Loading Model Artifacts!
+| INFO | Stacking Ensemble Loaded!
+| INFO | LSTM Model Loaded!
+| INFO | Sequence Normalization Parameters Loaded!
+| INFO | SHAP Explainer Ready!
+| INFO | Model Registry Ready! Features: 38
+
+|-- client.py --|
+=== Final API Verification ===
+
+Testing High Risk Student (Struggling - Very Low Engagement)
+Risk: High Risk | Prob: 0.9827 | Conf: High
+
+Testing Normal Student (High Engagement - Consistent Activity)
+Risk: Low Risk | Prob: 0.1217 | Conf: High
+
+|-- evaluation.py --|
+================================================================================
+Evaluation Suite — Stress Detection Research
+================================================================================
+
+================================================================================
+Section 1: Loading Pipeline Artifacts
+================================================================================
+Loaded: nckh\stackingEnsemble.pkl
+Loaded: nckh\scaler.pkl
+Loading Pre-Engineered Features From Cache: nckh\evaluationCache.pkl
+
+================================================================================
+Section 2: Ablation Study — Feature Family Contribution
+================================================================================
+
+Full Model → Acc: 0.9196  F1: 0.9264  AUC: 0.9739
+
+Saved: ablationStudy.png
+
+================================================================================
+Section 3: McNemar's Test — Statistical Significance
+================================================================================
+
+McNemar χ² = 1302.0006
+p-value = 0.000000
+Significant: Yes ✓
+
+================================================================================
+Section 4: Bootstrap Confidence Intervals (95%, n=2000)
+================================================================================
+
+================================================================================
+Section 5: SHAP Waterfall — Individual Student Explanations
+================================================================================
+Generating 6 Individual SHAP Waterfall Reports...
+Saved: shapHighRisk1.png
+Saved: shapHighRisk2.png
+Saved: shapHighRisk3.png
+Saved: shapLowRisk1.png
+Saved: shapLowRisk2.png
+Saved: shapLowRisk3.png
+Saved: shapGlobalBar.png
+
+================================================================================
+Section 6: Learning Curve — Bias/Variance Diagnosis
+================================================================================
+Calculating Learning Curve (5-Fold Stratified CV)...
+Saved: learningCurve.png
+
+================================================================================
+Section 7: Probability Calibration Curve
+================================================================================
+Brier Score: 0.0519
+Saved: calibrationCurve.png
+
+================================================================================
+Section 8: Exporting LaTeX Results Table
+================================================================================
+Formatting Metrics Into LaTeX Table Format...
+Saved: resultsTable.tex
+
+================================================================================
+Evaluation Complete — All Outputs Saved To NCKH!
+================================================================================

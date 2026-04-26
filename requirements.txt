@@ -1,0 +1,15 @@
+imbalanced-learn
+python-multipart
+scikit-learn
+statsmodels
+matplotlib
+lightgbm
+uvicorn
+xgboost
+seaborn
+fastapi
+pandas
+joblib
+torch
+numpy
+shap

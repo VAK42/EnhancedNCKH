@@ -2,79 +2,80 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import torch.optim as optim
 import lightgbm as lgb
-import torch.nn as nn
-import seaborn as sns
 import xgboost as xgb
+import seaborn as sns
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 import warnings
-import requests
-import zipfile
 import joblib
 import torch
 import shap
 import sys
-import os
-import io
-import re
-from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, confusion_matrix, matthews_corrcoef, roc_curve)
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, matthews_corrcoef, cohen_kappa_score, average_precision_score, precision_recall_curve, classification_report, confusion_matrix, roc_curve, log_loss)
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.calibration import CalibratedClassifierCV
 from torch.utils.data import DataLoader, TensorDataset
 from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import StackingClassifier
 from imblearn.over_sampling import SMOTE
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 warnings.filterwarnings('ignore')
+sys.stdout.reconfigure(encoding='utf-8')
 pd.set_option('display.max_columns', None)
-plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_theme(style='whitegrid')
 randomState = 42
 testSize = 0.2
 valSize = 0.1
 seqLen = 30
-LSTMHidden = 64
-LSTMLayers = 2
 LSTMDropout = 0.3
-LSTMEpochs = 30
-LSTMBatch = 64
+LSTMHidden = 64
+LSTMEpochs = 50
+LSTMBatch = 128
+LSTMLayers = 2
 LSTMLR = 5e-4
 nFolds = 5
-dataDir = Path("data")
-outputDir = Path("nckh")
-dataDir.mkdir(exist_ok=True)
-outputDir.mkdir(exist_ok=True)
+defaultThresh = 0.5
+dataD = Path("data")
+outputD = Path("nckh")
+modelD = outputD / "model"
+imgD = outputD / "img"
+dataD.mkdir(exist_ok=True)
+modelD.mkdir(parents=True, exist_ok=True)
+imgD.mkdir(parents=True, exist_ok=True)
 np.random.seed(randomState)
 torch.manual_seed(randomState)
 def showBanner(title):
   print("\n" + "=" * 80)
   print(f"{title}")
   print("=" * 80)
-def loadOULAD(dataDir: Path) -> dict:
-  showBanner("Section 1: Loading OULAD Dataset")
-  ouladDir = dataDir / "oulad"
-  coreRequired = ["studentInfo.csv", "studentVle.csv", "vle.csv", "studentAssessment.csv", "assessments.csv"]
-  missing = [f for f in coreRequired if not (ouladDir / f).exists()]
+def loadOULAD(dataD: Path) -> dict:
+  showBanner("S1: Loading OULAD Dataset")
+  ouladD = dataD / "oulad"
+  coreRequired = ["StudentInfo.csv", "StudentVLE.csv", "VLE.csv", "StudentAssessment.csv", "Assessments.csv"]
+  missing = [f for f in coreRequired if not (ouladD / f).exists()]
   if missing:
     raise FileNotFoundError(f"Missing Real OULAD Files: {missing}! Please Place Them In data/oulad!")
-  info = pd.read_csv(ouladDir / "studentInfo.csv")
-  svle = pd.read_csv(ouladDir / "studentVle.csv")
-  vleMeta = pd.read_csv(ouladDir / "vle.csv")
-  sa = pd.read_csv(ouladDir / "studentAssessment.csv")
-  assessments = pd.read_csv(ouladDir / "assessments.csv")
-  svle = svle.merge(vleMeta[['id_site', 'activity_type']].drop_duplicates(), on='id_site', how='left')
+  info = pd.read_csv(ouladD / "StudentInfo.csv")
+  svle = pd.read_csv(ouladD / "StudentVLE.csv", usecols=['id_student', 'id_site', 'date', 'sum_click'], dtype={'id_student': 'int32', 'id_site': 'int32', 'date': 'int16', 'sum_click': 'int16'})
+  vleMeta = pd.read_csv(ouladD / "VLE.csv", usecols=['id_site', 'activity_type'], dtype={'id_site': 'int32'})
+  sa = pd.read_csv(ouladD / "StudentAssessment.csv")
+  assessments = pd.read_csv(ouladD / "Assessments.csv")
+  svle = svle.merge(vleMeta.drop_duplicates('id_site'), on='id_site', how='left')
+  svle.drop(columns=['id_site'], inplace=True)
+  svle.sort_values(['id_student', 'date'], inplace=True)
   print(f"Loaded Student Info → {len(info):>8,} Rows")
-  print(f"Loaded Student VLE → {len(svle):>8,} Rows  (Merged With vle.csv)")
+  print(f"Loaded Student VLE → {len(svle):>8,} Rows")
   print(f"Loaded Student Assessment → {len(sa):>8,} Rows")
   print(f"Loaded Assessments → {len(assessments):>8,} Rows")
   print(f"Unique Students → {info['id_student'].nunique():>8,}")
   sa = sa.merge(assessments[['id_assessment', 'date']], on='id_assessment', how='left')
   return {'info': info, 'vle': svle, 'studentassessment': sa, 'assessments_meta': assessments}
 def buildStressLabels(oulad: dict) -> pd.DataFrame:
-  showBanner("Section 2: Label Construction — Stress Proxy")
+  showBanner("S2: Label Construction - Stress Proxy")
   info = oulad['info'].copy()
   if '_stress_label' in info.columns:
     labels = info[['id_student', '_stress_label']].rename(columns={'_stress_label': 'stress_label'})
@@ -102,8 +103,8 @@ def rollingStdCalc(dates, clicks, window=7):
       stds.append(clicks[mask].std())
   return np.mean(stds) if stds else 0.0
 def engineerVLEFeatures(oulad: dict) -> pd.DataFrame:
-  showBanner("Section 3a: VLE Feature Engineering (Session & Temporal)")
-  vle = oulad['vle'].copy().sort_values(['id_student', 'date'])
+  showBanner("S3.1: VLE Feature Engineering - Session + Temporal")
+  vle = oulad['vle']
   feats = []
   for sid, grp in vle.groupby('id_student'):
     clicks = grp['sum_click'].values
@@ -127,10 +128,7 @@ def engineerVLEFeatures(oulad: dict) -> pd.DataFrame:
     earlyClicks = clicks[dates <= (firstAccess + mid)].sum()
     lateClicks = clicks[dates > (firstAccess + mid)].sum()
     lateDrop = (earlyClicks - lateClicks) / (earlyClicks + 1e-6)
-    if len(clicks) > 2:
-      slope = np.polyfit(np.arange(len(clicks)), clicks, 1)[0]
-    else:
-      slope = 0.0
+    slope = np.polyfit(np.arange(len(clicks)), clicks, 1)[0] if len(clicks) > 2 else 0.0
     cvClicks = stdClicks / (meanClicks + 1e-6)
     if 'activity_type' in grp.columns:
       nTypes = grp['activity_type'].nunique()
@@ -173,10 +171,10 @@ def engineerVLEFeatures(oulad: dict) -> pd.DataFrame:
   print(f"VLE Features Shape: {df.shape}")
   return df
 def engineerAssessmentFeatures(oulad: dict) -> pd.DataFrame:
-  showBanner("Section 3b: Assessment Feature Engineering")
+  showBanner("S3.2: Assessment Feature Engineering")
   asmnt = oulad.get('studentassessment', oulad.get('assessments', pd.DataFrame()))
   if asmnt.empty:
-    print("No Assessment Data Found, Skipping!")
+    print("No Assessment Data Found! Skipping!")
     return pd.DataFrame()
   feats = []
   for sid, grp in asmnt.groupby('id_student'):
@@ -189,10 +187,7 @@ def engineerAssessmentFeatures(oulad: dict) -> pd.DataFrame:
     maxScore = scores.max()
     nSubmitted = len(scores)
     failRate = (scores < 40).mean()
-    if len(scores) > 2:
-      scoreSlope = np.polyfit(np.arange(len(scores)), scores, 1)[0]
-    else:
-      scoreSlope = 0.0
+    scoreSlope = np.polyfit(np.arange(len(scores)), scores, 1)[0] if len(scores) > 2 else 0.0
     lateSubmit = 0.0
     if 'date_submitted' in grp.columns and 'date' in grp.columns:
       lateSubmit = (grp['date_submitted'] > grp['date']).mean()
@@ -213,7 +208,7 @@ def engineerAssessmentFeatures(oulad: dict) -> pd.DataFrame:
   print(f"Assessment Features Shape: {df.shape}")
   return df
 def engineerStudentInfoFeatures(oulad: dict) -> pd.DataFrame:
-  showBanner("Section 3c: Student Info Features")
+  showBanner("S3.3: Student Info Features")
   info = oulad['info'].copy()
   catCols = ['gender', 'age_band', 'highest_education', 'disability']
   for col in catCols:
@@ -225,7 +220,7 @@ def engineerStudentInfoFeatures(oulad: dict) -> pd.DataFrame:
   print(f"Student Info Features Shape: {df.shape}")
   return df
 def mergeFeatures(vleFeats, asmntFeats, infoFeats, labels) -> pd.DataFrame:
-  showBanner("Section 3d: Merging All Feature Tables")
+  showBanner("S3.4: Merging All Feature Tables")
   df = labels.copy()
   df = df.merge(vleFeats, on='id_student', how='left')
   if not asmntFeats.empty:
@@ -238,8 +233,8 @@ def mergeFeatures(vleFeats, asmntFeats, infoFeats, labels) -> pd.DataFrame:
   print(f"Feature Count: {df.shape[1] - 2}")
   return df
 def buildSequences(oulad: dict, labels: pd.DataFrame, currentSeqLen=seqLen) -> tuple:
-  showBanner("Section 4: Building LSTM Sequences From VLE Logs")
-  vle = oulad['vle'].copy().sort_values(['id_student', 'date'])
+  showBanner("S4: Building LSTM Sequences From VLE Logs")
+  vle = oulad['vle']
   if 'activity_type' in vle.columns:
     vle['activity_enc'] = LabelEncoder().fit_transform(vle['activity_type'].astype(str))
   else:
@@ -247,7 +242,7 @@ def buildSequences(oulad: dict, labels: pd.DataFrame, currentSeqLen=seqLen) -> t
   vle['week_num'] = (vle['date'] // 7).clip(0, 52)
   vle['day_of_week'] = (vle['date'] % 7)
   labelMap = labels.set_index('id_student')['stress_label'].to_dict()
-  X_list, y_list, studentIdsInSeq = [], [], []
+  XList, yList, studentIdsInSeq = [], [], []
   for sid, grp in vle.groupby('id_student'):
     if sid not in labelMap:
       continue
@@ -257,18 +252,18 @@ def buildSequences(oulad: dict, labels: pd.DataFrame, currentSeqLen=seqLen) -> t
     else:
       pad = np.zeros((currentSeqLen - len(seqFeats), seqFeats.shape[1]), dtype=np.float32)
       seq = np.vstack([pad, seqFeats])
-    X_list.append(seq)
-    y_list.append(labelMap[sid])
+    XList.append(seq)
+    yList.append(labelMap[sid])
     studentIdsInSeq.append(sid)
-    if len(X_list) % 5000 == 0:
-      print(f"... Built Sequences For {len(X_list):,} Students")
-  X = np.array(X_list, dtype=np.float32)
-  y = np.array(y_list, dtype=np.int64)
+    if len(XList) % 5000 == 0:
+      print(f"... Built Sequences For {len(XList):,} Students")
+  X = np.array(XList, dtype=np.float32)
+  y = np.array(yList, dtype=np.int64)
   shapeOrig = X.shape
-  X_flat = X.reshape(-1, X.shape[-1])
-  globalMean = X_flat.mean(axis=0)
-  globalStd = X_flat.std(axis=0) + 1e-6
-  X = ((X_flat - globalMean) / globalStd).reshape(shapeOrig)
+  XFlat = X.reshape(-1, X.shape[-1])
+  globalMean = XFlat.mean(axis=0)
+  globalStd = XFlat.std(axis=0) + 1e-6
+  X = ((XFlat - globalMean) / globalStd).reshape(shapeOrig)
   print(f"Sequence Tensor Shape: {X.shape}")
   print(f"Label Distribution: Normal={sum(y==0)} | Stressed={sum(y==1)}")
   return X, y, globalMean, globalStd, studentIdsInSeq
@@ -295,17 +290,17 @@ class StressLSTM(nn.Module):
     out, _ = self.lstm(x)
     attn = torch.softmax(self.attention(out), dim=1)
     return (attn * out).sum(dim=1)
-def trainLSTM(X_seq, y_seq, studentIds) -> tuple:
-  showBanner("Section 5: Training Bi-LSTM With Attention")
-  X_tr, X_te, y_tr, y_te = train_test_split(X_seq, y_seq, test_size=testSize, random_state=randomState, stratify=y_seq)
+def trainLSTM(XSeq, ySeq, studentIds) -> tuple:
+  showBanner("S5: Training Bi-LSTM With Attention")
+  XTr, XTe, yTr, yTe = train_test_split(XSeq, ySeq, test_size=testSize, random_state=randomState, stratify=ySeq)
   device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   print(f"Device: {device}")
-  trainDs = TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr))
-  testDs = TensorDataset(torch.tensor(X_te), torch.tensor(y_te))
+  trainDs = TensorDataset(torch.tensor(XTr), torch.tensor(yTr))
+  testDs = TensorDataset(torch.tensor(XTe), torch.tensor(yTe))
   trainDl = DataLoader(trainDs, batch_size=LSTMBatch, shuffle=True)
   testDl = DataLoader(testDs, batch_size=LSTMBatch)
-  model = StressLSTM(inputSize=X_seq.shape[2]).to(device)
-  criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, len(y_tr[y_tr==0]) / (len(y_tr[y_tr==1]) + 1e-6)], dtype=torch.float32).to(device))
+  model = StressLSTM(inputSize=XSeq.shape[2]).to(device)
+  criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, len(yTr[yTr==0]) / (len(yTr[yTr==1]) + 1e-6)], dtype=torch.float32).to(device))
   optimizer = optim.Adam(model.parameters(), lr=LSTMLR, weight_decay=1e-4)
   scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LSTMEpochs)
   history = {'train_loss': [], 'val_acc': []}
@@ -339,7 +334,7 @@ def trainLSTM(X_seq, y_seq, studentIds) -> tuple:
   model.load_state_dict(bestState)
   print(f"\nBest LSTM Val Accuracy: {bestAcc:.4f}")
   model.eval()
-  allDl = DataLoader(TensorDataset(torch.tensor(X_seq), torch.tensor(y_seq)), batch_size=LSTMBatch)
+  allDl = DataLoader(TensorDataset(torch.tensor(XSeq), torch.tensor(ySeq)), batch_size=LSTMBatch)
   probs = []
   with torch.no_grad():
     for xb, _ in allDl:
@@ -348,10 +343,10 @@ def trainLSTM(X_seq, y_seq, studentIds) -> tuple:
       probs.extend(p)
   probs = np.array(probs).reshape(-1, 1)
   probMap = dict(zip(studentIds, probs.flatten()))
-  return model, probMap, history, (X_te, y_te, allPreds)
-def printEnsembleMetrics(yTe, yPred, yPredTuned, yProba, thresh):
+  return model, probMap, history, (XTe, yTe, allPreds)
+def printEnsembleMetrics(yTe, yPred, yPredTuned, yProba, thresh, defThresh=defaultThresh):
   print("\n" + "-" * 60)
-  print("Ensemble Results (Default Threshold = 0.5)")
+  print(f"Ensemble Results (Default Threshold = {defThresh:.3f})")
   print("-" * 60)
   print(f"Accuracy: {accuracy_score(yTe, yPred):.4f}")
   print(f"Precision: {precision_score(yTe, yPred, zero_division=0):.4f}")
@@ -368,7 +363,7 @@ def printEnsembleMetrics(yTe, yPred, yPredTuned, yProba, thresh):
   print(f"MCC: {matthews_corrcoef(yTe, yPredTuned):.4f}")
   print(f"\n{classification_report(yTe, yPredTuned, target_names=['Normal','Stressed'])}")
 def trainEnsemble(tabularDf: pd.DataFrame, LSTMProbs: np.ndarray) -> dict:
-  showBanner("Section 7: Stacking Ensemble — XGBoost + LightGBM + LSTM")
+  showBanner("S7: Stacking Ensemble - XGBoost + LightGBM + LSTM")
   featureCols = [c for c in tabularDf.columns if c not in ('id_student', 'stress_label')]
   XFull = tabularDf[featureCols].values
   y = tabularDf['stress_label'].values
@@ -376,14 +371,14 @@ def trainEnsemble(tabularDf: pd.DataFrame, LSTMProbs: np.ndarray) -> dict:
   smote = SMOTE(random_state=randomState)
   XTr, XTe, yTr, yTe = train_test_split(XFull, y, test_size=testSize, random_state=randomState, stratify=y)
   XTrS, yTrS = smote.fit_resample(XTr, yTr)
-  print(f"\nAfter SMOTE — Normal: {sum(yTrS==0)} | Stressed: {sum(yTrS==1)}")
+  print(f"\nAfter SMOTE - Normal: {sum(yTrS==0)} | Stressed: {sum(yTrS==1)}")
   scaler = StandardScaler()
   XTrSc = scaler.fit_transform(XTrS)
   XTeSc = scaler.transform(XTe)
   xgbModel = xgb.XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, eval_metric='logloss', random_state=randomState, n_jobs=-1)
   lgbModel = lgb.LGBMClassifier(n_estimators=500, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=randomState, n_jobs=-1, verbose=-1)
-  stack = StackingClassifier(estimators=[('xgb', xgbModel), ('lgb', lgbModel)], final_estimator=LogisticRegression(max_iter=1000, random_state=randomState), cv=5, passthrough=False, n_jobs=-1)
-  print("\nFitting Stacking Ensemble (This May Take A Few Minutes)...")
+  stack = StackingClassifier(estimators=[('xgb', xgbModel), ('lgb', lgbModel)], final_estimator=LogisticRegression(max_iter=1000, random_state=randomState), cv=5, passthrough=False, n_jobs=1)
+  print("\nFitting Stacking Ensemble...")
   stack.fit(XTrSc, yTrS)
   yPred = stack.predict(XTeSc)
   yProba = stack.predict_proba(XTeSc)[:, 1]
@@ -394,12 +389,13 @@ def trainEnsemble(tabularDf: pd.DataFrame, LSTMProbs: np.ndarray) -> dict:
     'model': stack, 'scaler': scaler, 'X_test': XTeSc, 'y_test': yTe,
     'y_pred': yPred, 'y_pred_tuned': yPredTuned, 'y_proba': yProba,
     'best_thresh': bestThresh, 'feature_cols': featureCols,
-    'X_train': XTrSc, 'y_train': yTrS,
+    'X_train': XTrSc, 'y_train': yTrS, 'tabular_df': tabularDf,
+    'X_tr': XTr, 'X_te': XTe, 'y_tr': yTr, 'y_te': yTe, 'X_te_sc': XTeSc,
   }
   printEnsembleMetrics(yTe, yPred, yPredTuned, yProba, bestThresh)
   return results
 def crossValidateModels(tabularDf: pd.DataFrame) -> dict:
-  showBanner("Section 8: Stratified K-Fold Cross Validation")
+  showBanner("S8: Stratified K-Fold Cross Validation")
   featureCols = [c for c in tabularDf.columns if c not in ('id_student', 'stress_label')]
   X = tabularDf[featureCols].values
   y = tabularDf['stress_label'].values
@@ -412,120 +408,259 @@ def crossValidateModels(tabularDf: pd.DataFrame) -> dict:
   }
   cvResults = {}
   for name, pipeline in modelsToCv.items():
-    scores = cross_val_score(pipeline, X, y, cv=skf, scoring='accuracy', n_jobs=-1)
+    scores = cross_val_score(pipeline, X, y, cv=skf, scoring='accuracy', n_jobs=1)
     cvResults[name] = scores
     print(f"\n{name} (CV With SMOTE):")
-    print(f"  Mean Acc: {scores.mean():.4f} ± {scores.std():.4f}")
+    print(f"  Mean Accuracy: {scores.mean():.4f} ± {scores.std():.4f}")
     print(f"  Folds: {[f'{s:.4f}' for s in scores]}")
   return cvResults
-def SHAPAnalysis(results: dict, tabularDf: pd.DataFrame, outDir: Path):
-  showBanner("Section 9: SHAP Feature Interpretability")
+def SHAPAnalysis(results: dict, tabularDf: pd.DataFrame, outD: Path):
+  showBanner("S9: SHAP Feature Interpretability")
   featureCols = results['feature_cols']
   XTe = results['X_test']
+  yTe = results['y_test']
   try:
     xgbBase = results['model'].named_estimators_['xgb']
     explainer = shap.TreeExplainer(xgbBase)
-    shapVals = explainer.shap_values(XTe)
-    plt.figure(figsize=(12, 7))
-    shap.summary_plot(shapVals, XTe, feature_names=featureCols, show=False, max_display=20)
-    plt.title("SHAP Summary — XGBoost Base Learner", fontsize=13, fontweight='bold')
+    shapVals = explainer(XTe)
+    fig = plt.figure(figsize=(12, 7))
+    shap.summary_plot(shapVals.values, XTe, feature_names=featureCols, show=False, max_display=20)
+    plt.title('SHAP Global Feature Impact Distribution (Beeswarm)', fontsize=14, weight='bold', pad=15)
     plt.tight_layout()
-    plt.savefig(outDir / 'shapSummary.png', dpi=200, bbox_inches='tight')
-    plt.close()
-    print("SHAP Summary Saved → shapSummary.png")
+    plt.savefig(imgD / 'ShapSummary.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print("Saved: ShapSummary.png")
+    fig = plt.figure(figsize=(12, 7))
+    shap.summary_plot(shapVals.values, XTe, feature_names=featureCols, plot_type='bar', show=False, max_display=20)
+    plt.title('SHAP Global Feature Importance (Mean |SHAP|)', fontsize=14, weight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig(imgD / 'ShapGlobalBar.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print("Saved: ShapGlobalBar.png")
+    stressedMask = (yTe == 1)
+    normalMask = (yTe == 0)
+    stressedMean = np.mean(shapVals.values[stressedMask], axis=0)
+    normalMean = np.mean(shapVals.values[normalMask], axis=0)
+    topIdx = np.argsort(np.abs(np.mean(shapVals.values, axis=0)))[-12:]
+    topNames = [featureCols[i] for i in topIdx]
+    fig, ax = plt.subplots(figsize=(12, 7))
+    yPos = np.arange(len(topNames)); w = 0.35
+    ax.barh(yPos - w/2, stressedMean[topIdx], w, label='Stressed Student Cohort (T=1)', color='#E76F51', edgecolor='black')
+    ax.barh(yPos + w/2, normalMean[topIdx], w, label='Normal Student Cohort (T=0)', color='#2A9D8F', edgecolor='black')
+    ax.set_yticks(yPos); ax.set_yticklabels(topNames, fontsize=11, weight='bold')
+    ax.set_xlabel('Mean SHAP Contribution Value', fontsize=12, weight='bold')
+    ax.set_title('Cohort Comparison: Mean Feature Impact For Stressed vs Normal Students', fontsize=14, weight='bold', pad=15)
+    ax.axvline(0, color='black', linestyle='--', lw=1)
+    ax.legend(loc='lower right', fontsize=11); ax.grid(axis='x', linestyle=':', alpha=0.7)
+    fig.tight_layout(); fig.savefig(imgD / 'ShapCohortComparison.png', dpi=300, bbox_inches='tight'); plt.close(fig)
+    print("Saved: ShapCohortComparison.png")
   except Exception as e:
     print(f"SHAP Analysis Skipped: {e}!")
-def generateVisualizations(results: dict, cvResults: dict, LSTMHistory: dict, outDir: Path):
-  showBanner("Section 10: Generating Visualizations")
+def generateVisualizations(results: dict, cvResults: dict, LSTMHist: dict, outD: Path, tabularDf: pd.DataFrame = None):
+  showBanner("S10: Generating Visualizations")
   yTe = results['y_test']
   yPred = results['y_pred_tuned']
   yProba = results['y_proba']
   fpr, tpr, _ = roc_curve(yTe, yProba)
   aucScore = roc_auc_score(yTe, yProba)
-  fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-  axes[0].plot(fpr, tpr, color='steelblue', lw=2, label=f'AUC = {aucScore:.4f}')
-  axes[0].plot([0,1],[0,1], 'k--', lw=1)
-  axes[0].fill_between(fpr, tpr, alpha=0.15, color='steelblue')
-  axes[0].set_xlabel('False Positive Rate'); axes[0].set_ylabel('True Positive Rate')
-  axes[0].set_title('ROC Curve — Stacking Ensemble', fontweight='bold')
-  axes[0].legend(loc='lower right')
-  cm = confusion_matrix(yTe, yPred)
-  sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[1], xticklabels=['Normal','Stressed'], yticklabels=['Normal','Stressed'])
-  axes[1].set_title('Confusion Matrix (Tuned Threshold)', fontweight='bold')
-  axes[1].set_ylabel('True'); axes[1].set_xlabel('Predicted')
-  if LSTMHistory:
-    ep = range(1, len(LSTMHistory['val_acc']) + 1)
-    ax3 = axes[2]; ax3_twin = ax3.twinx()
-    ax3.plot(ep, LSTMHistory['train_loss'], 'coral', lw=2, label='Train Loss')
-    ax3_twin.plot(ep, LSTMHistory['val_acc'], 'steelblue', lw=2, label='Val Accuracy')
-    ax3.set_xlabel('Epoch'); ax3.set_ylabel('Loss', color='coral')
-    ax3_twin.set_ylabel('Accuracy', color='steelblue')
-    ax3.set_title('LSTM Training History', fontweight='bold')
-    ax3.legend(loc='upper left'); ax3_twin.legend(loc='upper right')
-  plt.tight_layout()
-  plt.savefig(outDir / 'ROCCMLSTM.png', dpi=200, bbox_inches='tight')
-  plt.close()
+  fig, ax = plt.subplots(figsize=(8, 6))
+  ax.plot(fpr, tpr, color='#1B365D', lw=2.5, label=f'Stacking Ensemble (AUC = {aucScore:.4f})')
+  ax.plot([0, 1], [0, 1], 'k--', lw=1.2, alpha=0.7, label='Random Baseline (AUC = 0.5000)')
+  ax.fill_between(fpr, tpr, alpha=0.15, color='#1B365D')
+  ax.set_xlabel('False Positive Rate (1 - Specificity)', fontsize=12, weight='bold')
+  ax.set_ylabel('True Positive Rate (Recall / Sensitivity)', fontsize=12, weight='bold')
+  ax.set_title('Receiver Operating Characteristic Curve', fontsize=14, weight='bold', pad=15)
+  ax.legend(loc='lower right', fontsize=11); ax.grid(True, linestyle=':', alpha=0.7)
+  ax.set_xlim([0.0, 1.0]); ax.set_ylim([0.0, 1.05])
+  fig.tight_layout(); fig.savefig(imgD / 'ROCCurve.png', dpi=300); plt.close(fig)
+  print("Saved: ROCCurve.png")
+  if LSTMHist:
+    nEpochs = len(LSTMHist['val_acc'])
+    ep = range(1, nEpochs + 1)
+    fig, ax1 = plt.subplots(figsize=(9, 6))
+    ax2 = ax1.twinx()
+    line1 = ax1.plot(ep, LSTMHist['train_loss'], color='#E76F51', lw=2.5, label='Training Loss')
+    line2 = ax2.plot(ep, LSTMHist['val_acc'], color='#2A9D8F', lw=2.5, label='Validation Accuracy')
+    ax1.set_xlabel(f'Epoch ({nEpochs})', fontsize=12, weight='bold')
+    ax1.set_ylabel('Training Loss', color='#E76F51', fontsize=12, weight='bold')
+    ax2.set_ylabel('Validation Accuracy', color='#2A9D8F', fontsize=12, weight='bold')
+    ax1.set_title(f'Bi-LSTM Temporal Model Training Dynamics Across {nEpochs} Epochs', fontsize=13, weight='bold', pad=15)
+    lines = line1 + line2; labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='center right', fontsize=11)
+    fig.tight_layout(); fig.savefig(imgD / 'LSTMTrainingHistory.png', dpi=300); plt.close(fig)
+    print("Saved: LSTMTrainingHistory.png")
+  precPR, recPR, _ = precision_recall_curve(yTe, yProba)
+  prAuc = average_precision_score(yTe, yProba)
+  baselineRatio = sum(yTe == 1) / len(yTe)
+  fig, ax = plt.subplots(figsize=(8, 6))
+  ax.plot(recPR, precPR, color='#2A9D8F', lw=2.5, label=f'Stacking Ensemble (PR-AUC = {prAuc:.4f})')
+  ax.axhline(baselineRatio, color='#E76F51', linestyle='--', lw=1.5, label=f'No-Skill Baseline ({baselineRatio:.4f})')
+  ax.fill_between(recPR, precPR, alpha=0.15, color='#2A9D8F')
+  ax.set_xlabel('Recall / Sensitivity', fontsize=12, weight='bold')
+  ax.set_ylabel('Precision', fontsize=12, weight='bold')
+  ax.set_title('Precision-Recall Curve', fontsize=13, weight='bold', pad=15)
+  ax.legend(loc='lower left', fontsize=11)
+  ax.set_ylim([0.0, 1.05]); ax.set_xlim([0.0, 1.0])
+  fig.tight_layout(); fig.savefig(imgD / 'PrecisionRecallCurve.png', dpi=300); plt.close(fig)
+  print("Saved: PrecisionRecallCurve.png")
   if cvResults:
     fig, ax = plt.subplots(figsize=(8, 5))
     names = list(cvResults.keys()); means = [v.mean() for v in cvResults.values()]; stds = [v.std() for v in cvResults.values()]
-    colors = ['#4ECDC4', '#45B7D1', '#96CEB4', '#FF6B6B']
-    bars = ax.bar(names, means, yerr=stds, capsize=5, color=colors[:len(names)], edgecolor='black')
+    colors = ['#2E86AB', '#E07A5F']
+    bars = ax.bar(names, means, yerr=stds, capsize=5, color=colors[:len(names)], edgecolor='black', width=0.45)
     for bar, m in zip(bars, means):
       ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, f'{m:.4f}', ha='center', fontweight='bold', fontsize=10)
-    ax.set_ylim([0.5, 1.05]); ax.set_ylabel('CV Accuracy', fontweight='bold')
-    ax.set_title(f'{nFolds}-Fold Stratified CV Comparison', fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(outDir / 'CVComparison.png', dpi=200, bbox_inches='tight')
-    plt.close()
-  metrics = {
-    'Accuracy': accuracy_score(yTe, yPred), 'Precision': precision_score(yTe, yPred, zero_division=0),
-    'Recall': recall_score(yTe, yPred, zero_division=0), 'F1-Score': f1_score(yTe, yPred, zero_division=0),
-    'ROC-AUC': aucScore, 'MCC': matthews_corrcoef(yTe, yPred),
-  }
-  fig, ax = plt.subplots(figsize=(9, 4)); ax.axis('off')
-  tableData = [[k, f'{v:.4f}'] for k, v in metrics.items()]
-  tbl = ax.table(cellText=tableData, colLabels=['Metric', 'Score'], cellLoc='center', loc='center')
-  tbl.auto_set_font_size(False); tbl.set_fontsize(13); tbl.scale(1.5, 2.0)
-  ax.set_title('Final Ensemble — Evaluation Summary', fontsize=14, fontweight='bold', pad=20)
-  plt.tight_layout()
-  plt.savefig(outDir / 'metricsSummary.png', dpi=200, bbox_inches='tight')
-  plt.close()
-  print("\nAll Visualizations Saved To:", outDir)
-def exportModels(results: dict, LSTMModel, outDir: Path, seqNorm=None):
-  showBanner("Section 11: Exporting Models")
-  joblib.dump(results['model'], outDir / 'stackingEnsemble.pkl')
-  joblib.dump(results['scaler'], outDir / 'scaler.pkl')
+    ax.set_ylim([0.85, 0.96]); ax.set_ylabel('Cross-Validation Accuracy', fontsize=12, weight='bold')
+    ax.set_title('5-Fold Stratified Cross-Validation Accuracy Comparison', fontsize=13, weight='bold', pad=15)
+    fig.tight_layout(); fig.savefig(imgD / 'CVComparison.png', dpi=300); plt.close(fig)
+    print("Saved: CVComparison.png")
+    fig, ax = plt.subplots(figsize=(11, 6))
+    foldNames = [f"Fold {i+1}" for i in range(nFolds)] + ["Mean CV"]
+    xPos = np.arange(len(foldNames)); w = 0.35
+    for idx, (name, scores) in enumerate(cvResults.items()):
+      scoresList = list(scores) + [scores.mean()]
+      offset = -w/2 if idx == 0 else w/2
+      color = "#2E86AB" if idx == 0 else "#E07A5F"
+      rects = ax.bar(xPos + offset, scoresList, w, label=name, color=color, edgecolor='black')
+      for rect in rects:
+        h = rect.get_height()
+        ax.annotate(f"{h:.4f}", xy=(rect.get_x() + rect.get_width()/2, h), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8, weight="bold")
+    ax.set_ylabel("Cross-Validation Accuracy", fontsize=12, weight="bold")
+    ax.set_title("5-Fold Stratified Cross-Validation Fold-By-Fold Breakdown", fontsize=14, weight="bold", pad=15)
+    ax.set_xticks(xPos); ax.set_xticklabels(foldNames, fontsize=11, weight="bold"); ax.set_ylim(0.88, 0.95)
+    ax.legend(loc="lower right", fontsize=11); ax.grid(axis="y", linestyle=":", alpha=0.7)
+    fig.tight_layout(); fig.savefig(imgD / 'CVFoldsDetail.png', dpi=300); plt.close(fig)
+    print("Saved: CVFoldsDetail.png")
+  cm = confusion_matrix(yTe, yPred)
+  tn, fp, fn, tp = cm.ravel()
+  total = len(yTe)
+  fig, ax = plt.subplots(figsize=(9, 8))
+  cax = ax.imshow(cm, cmap="Blues", interpolation="nearest")
+  fig.colorbar(cax, fraction=0.046, pad=0.04)
+  labels = [[f"TN = {tn:,}\n({tn/total*100:.2f}%)\nSpec: {tn/(tn+fp)*100:.2f}%", f"FP = {fp:,}\n({fp/total*100:.2f}%)\nFPR: {fp/(tn+fp)*100:.2f}%"], [f"FN = {fn:,}\n({fn/total*100:.2f}%)\nFNR: {fn/(fn+tp)*100:.2f}%", f"TP = {tp:,}\n({tp/total*100:.2f}%)\nRecall: {tp/(fn+tp)*100:.2f}%"]]
+  for i in range(2):
+    for j in range(2):
+      textColor = "white" if cm[i, j] > total * 0.25 else "black"
+      ax.text(j, i, labels[i][j], ha="center", va="center", color=textColor, fontsize=13, weight="bold")
+  ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+  ax.set_xticklabels(["Normal (0)", "Stressed (1)"], fontsize=12, weight="bold")
+  ax.set_yticklabels(["Normal (0)", "Stressed (1)"], fontsize=12, weight="bold")
+  ax.set_xlabel("Predicted Label", fontsize=13, weight="bold", labelpad=10)
+  ax.set_ylabel("True Actual Label", fontsize=13, weight="bold", labelpad=10)
+  acc = accuracy_score(yTe, yPred)
+  ax.set_title(f"Detailed Confusion Matrix (Test Set N = {total:,})\nTuned Youden Threshold = {results.get('best_thresh', defaultThresh):.3f} | Accuracy = {acc*100:.2f}%", fontsize=14, weight="bold", pad=15)
+  fig.tight_layout(); fig.savefig(imgD / 'ConfusionMatrix.png', dpi=300); plt.close(fig)
+  print("Saved: ConfusionMatrix.png")
+  mseVal = float(np.mean((yProba - yTe) ** 2))
+  logLossVal = float(log_loss(yTe, yProba))
+  fullHeaders = ["Metric", "Formula", "Value", "Notes"]
+  fullRows = [
+    ["Accuracy", "(TP + TN) / Total", f"{accuracy_score(yTe, yPred):.4f} ({accuracy_score(yTe, yPred)*100:.2f}%)", "Overall Correct Classification"],
+    ["Balanced Accuracy", "(TPR + TNR) / 2", f"{balanced_accuracy_score(yTe, yPred):.4f} ({balanced_accuracy_score(yTe, yPred)*100:.2f}%)", "Balanced Class Representation"],
+    ["Precision", "TP / (TP + FP)", f"{precision_score(yTe, yPred, zero_division=0):.4f} ({precision_score(yTe, yPred, zero_division=0)*100:.2f}%)", "Low False Alarm Rate"],
+    ["Recall / Sensitivity", "TP / (TP + FN)", f"{recall_score(yTe, yPred, zero_division=0):.4f} ({recall_score(yTe, yPred, zero_division=0)*100:.2f}%)", "High At-Risk Student Capture"],
+    ["Specificity", "TN / (TN + FP)", f"{float(tn / (tn + fp + 1e-6)):.4f} ({float(tn / (tn + fp + 1e-6))*100:.2f}%)", "Normal Student Recognition"],
+    ["F1-Score", "2 * (P * R) / (P + R)", f"{f1_score(yTe, yPred, zero_division=0):.4f} ({f1_score(yTe, yPred, zero_division=0)*100:.2f}%)", "Harmonic Balance of Precision & Recall"],
+    ["ROC-AUC", "Integral TPR d(FPR)", f"{aucScore:.4f} ({aucScore*100:.2f}%)", "Exceptional Discriminative Ability"],
+    ["PR-AUC", "Integral Prec d(Rec)", f"{prAuc:.4f} ({prAuc*100:.2f}%)", "Area Under Precision-Recall Curve"],
+    ["MCC", "(TP*TN - FP*FN) / Denom", f"{matthews_corrcoef(yTe, yPred):.4f}", "Robust Balanced Correlation Metric"],
+    ["Cohen's Kappa", "(p_o - p_e) / (1 - p_e)", f"{cohen_kappa_score(yTe, yPred):.4f}", "Inter-Rater Agreement Level"],
+    ["MSE / Brier Score", "Sum (p_i - y_i)^2 / N", f"{mseVal:.4f}", "Probability Calibration Quality"],
+    ["RMSE", "Sqrt(MSE)", f"{float(np.sqrt(mseVal)):.4f}", "Root Mean Square Prediction Error"],
+    ["MAE", "Sum |p_i - y_i| / N", f"{float(np.mean(np.abs(yProba - yTe))):.4f}", "Mean Absolute Error"],
+    ["Log-Loss", "-Sum [y ln p + (1-y) ln(1-p)] / N", f"{logLossVal:.4f}", "Cross-Entropy Penalty"]
+  ]
+  fig, ax = plt.subplots(figsize=(15, 9)); ax.axis('off')
+  tbl = ax.table(cellText=fullRows, colLabels=fullHeaders, cellLoc='center', loc='center')
+  tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1.2, 2.0)
+  for (r, c), cell in tbl.get_celld().items():
+    if r == 0:
+      cell.set_facecolor("#1B365D"); cell.set_text_props(color="white", weight="bold")
+    elif r % 2 == 0:
+      cell.set_facecolor("#F0F4F8")
+    else:
+      cell.set_facecolor("#FFFFFF")
+  ax.set_title("Full Comprehensive Evaluation Metrics Report", fontsize=15, weight="bold", pad=25)
+  fig.tight_layout(); fig.savefig(imgD / 'FullMetricsReport.png', dpi=300); plt.close(fig)
+  print("Saved: FullMetricsReport.png")
+  if tabularDf is not None:
+    nStressed = int((tabularDf['stress_label'] == 1).sum())
+    nNormal = int((tabularDf['stress_label'] == 0).sum())
+    labels1 = [f"Stressed / At-Risk (1)\n{nStressed:,} ({nStressed/len(tabularDf)*100:.1f}%)", f"Normal (0)\n{nNormal:,} ({nNormal/len(tabularDf)*100:.1f}%)"]
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.pie([nStressed, nNormal], labels=labels1, colors=["#E76F51", "#2A9D8F"], autopct="%1.1f%%", startangle=140, textprops={"fontsize": 11, "weight": "bold"}, explode=(0.04, 0))
+    ax.set_title(f"OULAD Student Label Distribution (Total: {len(tabularDf):,})", fontsize=13, weight="bold", pad=15)
+    fig.tight_layout(); fig.savefig(imgD / 'DatasetDistribution.png', dpi=300); plt.close(fig)
+    print("Saved: DatasetDistribution.png")
+    nTr = len(results['y_train']); nTe = len(results['y_test'])
+    labels2 = [f"Train Set (SMOTE, {nTr/(nTr+nTe)*100:.0f}%)\n{nTr:,} Students", f"Test Set ({nTe/(nTr+nTe)*100:.0f}%)\n{nTe:,} Students"]
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.pie([nTr, nTe], labels=labels2, colors=["#457B9D", "#F4A261"], autopct="%1.1f%%", startangle=140, textprops={"fontsize": 11, "weight": "bold"}, explode=(0.04, 0))
+    ax.set_title("Dataset Stratified Train / Test Partitioning", fontsize=13, weight="bold", pad=15)
+    fig.tight_layout(); fig.savefig(imgD / 'TrainTestSplit.png', dpi=300); plt.close(fig)
+    print("Saved: TrainTestSplit.png")
+  print("\nAll Visualizations Saved To:", imgD)
+def exportModels(results: dict, LSTMModel, outD: Path, LSTMHist: dict = None, seqNorm=None):
+  showBanner("S11: Exporting Models")
+  joblib.dump(results['model'], modelD / 'StackingEnsemble.pkl')
+  joblib.dump(results['scaler'], modelD / 'Scaler.pkl')
   if LSTMModel is not None:
-    torch.save(LSTMModel.state_dict(), outDir / 'LSTMModel.pt')
+    torch.save(LSTMModel.state_dict(), modelD / 'LSTM.pt')
   if seqNorm is not None:
-    joblib.dump(seqNorm, outDir / 'seqNorm.pkl')
-    print(f"seqNorm.pkl          → {outDir}")
-  print(f"stackingEnsemble.pkl → {outDir}")
-  print(f"scaler.pkl            → {outDir}")
-  print(f"LSTMModel.pt         → {outDir}")
+    joblib.dump(seqNorm, modelD / 'SeqNorm.pkl')
+    print(f"SeqNorm.pkl → {modelD}")
+  if LSTMHist is not None:
+    joblib.dump(LSTMHist, modelD / 'LSTMHistory.pkl')
+    print(f"LSTMHistory.pkl → {modelD}")
+  print(f"StackingEnsemble.pkl → {modelD}")
+  print(f"Scaler.pkl → {modelD}")
+  print(f"LSTM.pt → {modelD}")
+  evalCache = {
+    'model': results['model'], 'scaler': results['scaler'], 'tabular_df': results.get('tabular_df'),
+    'feature_cols': results['feature_cols'], 'X_tr': results.get('X_tr'), 'X_te': results.get('X_te'),
+    'y_tr': results.get('y_tr'), 'y_te': results['y_test'], 'X_te_sc': results['X_test'],
+    'y_pred': results['y_pred'], 'y_pred_tuned': results['y_pred_tuned'], 'y_proba': results['y_proba'],
+    'best_thresh': results['best_thresh'],
+  }
+  joblib.dump(evalCache, modelD / 'EvaluationCache.pkl')
+  print(f"EvaluationCache.pkl → {modelD}")
 def main():
   import time
   start = datetime.now(); tGlobal = time.time()
   print("\n" + "=" * 80)
   print("Stress Detection Via LMS Digital Signals")
   print("Pipeline: OULAD-Based Stress Detection")
-  print("Target  : 95–98% Accuracy Via Hybrid LSTM + XGBoost Stacking")
+  print("Target  : 90%+ Accuracy Via Hybrid LSTM + XGBoost Stacking")
   print("=" * 80)
   print(f"Started: {start.strftime('%Y-%m-%d %H:%M:%S')}")
-  print("\nPhase 1: Loading Datasets...")
-  t0 = time.time(); oulad = loadOULAD(dataDir)
-  print(f"Datasets Loaded In {time.time() - t0:.2f}s")
-  print("\nPhase 2: Building Labels & Feature Engineering...")
-  t0 = time.time(); labels = buildStressLabels(oulad)
-  vleFeats = engineerVLEFeatures(oulad); asmntFeats = engineerAssessmentFeatures(oulad)
-  infoFeats = engineerStudentInfoFeatures(oulad); tabularDf = mergeFeatures(vleFeats, asmntFeats, infoFeats, labels)
-  print(f"Feature Engineering Completed In {time.time() - t0:.2f}s")
-  print("\nPhase 3: OULAD Sequence Building & LSTM Training...")
-  t0 = time.time(); XSeq, ySeq, gMean, gStd, sidSeq = buildSequences(oulad, labels)
-  LSTMModel, LSTMProbMap, LSTMHist, LSTMEval = trainLSTM(XSeq, ySeq, sidSeq)
-  tabularDf['LSTM_prob'] = tabularDf['id_student'].map(LSTMProbMap)
-  tabularDf = tabularDf.dropna(subset=['LSTM_prob']).reset_index(drop=True)
-  print(f"LSTM Training Completed In {time.time() - t0:.2f}s")
+  featCachePath = modelD / "FeatureCache.pkl"
+  if featCachePath.exists():
+    showBanner("Resuming Pipeline From Checkpoint")
+    print(f"Loading Pre-Computed Features & LSTM From: {featCachePath}")
+    cached = joblib.load(featCachePath)
+    tabularDf = cached['tabularDf']
+    LSTMHist = cached['LSTMHist']
+    gMean, gStd = cached['seqNorm']
+    LSTMModel = cached.get('LSTMModel')
+  else:
+    print("\nPhase 1: Loading Datasets...")
+    t0 = time.time(); oulad = loadOULAD(dataD)
+    print(f"Datasets Loaded In {time.time() - t0:.2f}s")
+    print("\nPhase 2: Building Labels & Feature Engineering...")
+    t0 = time.time(); labels = buildStressLabels(oulad)
+    vleFeats = engineerVLEFeatures(oulad); asmntFeats = engineerAssessmentFeatures(oulad)
+    infoFeats = engineerStudentInfoFeatures(oulad); tabularDf = mergeFeatures(vleFeats, asmntFeats, infoFeats, labels)
+    print(f"Feature Engineering Completed In {time.time() - t0:.2f}s")
+    print("\nPhase 3: OULAD Sequence Building & LSTM Training...")
+    t0 = time.time(); XSeq, ySeq, gMean, gStd, sidSeq = buildSequences(oulad, labels)
+    LSTMModel, LSTMProbMap, LSTMHist, LSTMEval = trainLSTM(XSeq, ySeq, sidSeq)
+    tabularDf['LSTM_prob'] = tabularDf['id_student'].map(LSTMProbMap)
+    tabularDf = tabularDf.dropna(subset=['LSTM_prob']).reset_index(drop=True)
+    print(f"LSTM Training Completed In {time.time() - t0:.2f}s")
+    joblib.dump({'tabularDf': tabularDf, 'LSTMHist': LSTMHist, 'seqNorm': (gMean, gStd), 'LSTMModel': LSTMModel}, featCachePath)
+    if LSTMModel is not None:
+      torch.save(LSTMModel.state_dict(), modelD / 'LSTM.pt')
+    print(f"Checkpoint Saved To: {featCachePath}")
   print("\nPhase 4: Training Stacking Ensemble (XGBoost + LightGBM + Meta)...")
   t0 = time.time(); results = trainEnsemble(tabularDf, None)
   print(f"Stacking Ensemble Completed In {time.time() - t0:.2f}s")
@@ -533,21 +668,21 @@ def main():
   t0 = time.time(); cvResults = crossValidateModels(tabularDf)
   print(f"Cross Validation Completed In {time.time() - t0:.2f}s")
   print("\nPhase 6: Running SHAP Interpretability Analysis...")
-  t0 = time.time(); SHAPAnalysis(results, tabularDf, outputDir)
+  t0 = time.time(); SHAPAnalysis(results, tabularDf, outputD)
   print(f"SHAP Analysis Completed In {time.time() - t0:.2f}s")
   print("\nPhase 7: Generating Output Visualizations...")
-  t0 = time.time(); generateVisualizations(results, cvResults, LSTMHist, outputDir)
+  t0 = time.time(); generateVisualizations(results, cvResults, LSTMHist, outputD, tabularDf)
   print(f"Visualizations Generated In {time.time() - t0:.2f}s")
   print("\nPhase 8: Exporting Final Models...")
-  t0 = time.time(); exportModels(results, LSTMModel, outputDir, seqNorm=(gMean, gStd))
+  t0 = time.time(); exportModels(results, LSTMModel, outputD, LSTMHist=LSTMHist, seqNorm=(gMean, gStd))
   print(f"Model Export Completed In {time.time() - t0:.2f}s")
-  showBanner("Pipeline Complete")
+  showBanner("Finished!!")
   yTe = results['y_test']; yPred = results['y_pred_tuned']
   print(f"\nFinal Accuracy: {accuracy_score(yTe, yPred):.4f}")
   print(f"Final F1-Score: {f1_score(yTe, yPred, zero_division=0):.4f}")
   print(f"Final ROC-AUC: {roc_auc_score(yTe, results['y_proba']):.4f}")
   print(f"Total Pipeline Elapsed Time: {time.time() - tGlobal:.2f}s")
-  print(f"Outputs Saved To: {outputDir.resolve()}")
+  print(f"Outputs Saved To: {outputD.resolve()}")
   print("\n" + "=" * 80)
 if __name__ == "__main__":
   main()
